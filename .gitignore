@@ -1,0 +1,29 @@
+# Java and Maven
+target/
+*.class
+*.jar
+*.war
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+application-local.properties
+
+# Node and React
+node_modules/
+dist/
+build/
+
+# IDE files
+.idea/
+.vscode/
+*.iml
+
+# Operating system files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
