@@ -1,17 +1,25 @@
 package com.newgen.banking.controller;
 
-import com.newgen.banking.entity.Customer;
+import com.newgen.banking.dto.CustomerRequest;
+import com.newgen.banking.dto.CustomerResponse;
+import com.newgen.banking.dto.PagedResponse;
 import com.newgen.banking.service.CustomerService;
 import jakarta.validation.Valid;
-import jakarta.validation.constraints.Email;
-import jakarta.validation.constraints.NotBlank;
-import jakarta.validation.constraints.Pattern;
-import jakarta.validation.constraints.Size;
 import org.springframework.http.HttpStatus;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
 
+/**
+ * REST controller exposing customer registration and retrieval endpoints.
+ */
 @RestController
 @RequestMapping("/api/customers")
 public class CustomerController {
@@ -22,39 +30,28 @@ public class CustomerController {
         this.customerService = customerService;
     }
 
-    public record CustomerRequest(
-
-            @NotBlank(message = "Name is required")
-            @Size(max = 100, message = "Name cannot exceed 100 characters")
-            String fullName,
-
-            @NotBlank(message = "Email is required")
-            @Email(message = "Enter a valid email")
-            @Size(max = 150)
-            String email,
-
-            @Pattern(regexp = "^[0-9]{10,15}$",
-                    message = "Phone must contain 10 to 15 digits")
-            String phone
-    ) {}
-
     @PostMapping
-    @ResponseStatus(HttpStatus.CREATED)
-    public Customer createCustomer(@Valid @RequestBody CustomerRequest request) {
-        return customerService.createCustomer(
-                request.fullName(),
-                request.email(),
-                request.phone()
-        );
+    public ResponseEntity<CustomerResponse> createCustomer(@Valid @RequestBody CustomerRequest request) {
+        CustomerResponse created = customerService.createCustomer(request);
+        return ResponseEntity.status(HttpStatus.CREATED).body(created);
     }
 
     @GetMapping
-    public List<Customer> getAllCustomers() {
-        return customerService.getAllCustomers();
+    public ResponseEntity<List<CustomerResponse>> getAllCustomers() {
+        return ResponseEntity.ok(customerService.getAllCustomers());
+    }
+
+    @GetMapping("/paged")
+    public ResponseEntity<PagedResponse<CustomerResponse>> getCustomersPaged(
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "20") int size,
+            @RequestParam(defaultValue = "id") String sortBy,
+            @RequestParam(defaultValue = "asc") String sortDir) {
+        return ResponseEntity.ok(customerService.getCustomers(page, size, sortBy, sortDir));
     }
 
     @GetMapping("/{id}")
-    public Customer getCustomerById(@PathVariable Long id) {
-        return customerService.getCustomerById(id);
+    public ResponseEntity<CustomerResponse> getCustomerById(@PathVariable Long id) {
+        return ResponseEntity.ok(customerService.getCustomerById(id));
     }
 }
