@@ -4,22 +4,22 @@
 
 This project is a Java, Spring Boot, and PostgreSQL banking transaction processing system designed to support customer and account management, deposits, withdrawals, fund transfers, concurrent transaction processing, and audit/failure tracking.
 
-## Current Implementation Status (Day 2 Foundation)
+## Current Implementation Status (Day 3 Core Transactions)
 
 Currently implemented:
 - Spring Boot Maven backend skeleton (`banking-system`)
-- PostgreSQL database DDL for `customers` (`database/ddl/001_create_customers.sql`) and `accounts` + `account_number_seq` (`database/ddl/002_create_accounts.sql`)
+- PostgreSQL DDL for `customers` (`001_create_customers.sql`), `accounts` + `account_number_seq` (`002_create_accounts.sql`), and `bank_transactions`, `transaction_audits`, `failed_transactions` (`003_create_transactions.sql`)
 - Health check endpoint (`GET /api/v1/health`)
-- Customer registration and retrieval APIs (`POST /api/customers`, `GET /api/customers`, `GET /api/customers/paged`, `GET /api/customers/{id}`)
-- Account management APIs (`POST /api/accounts`, `GET /api/accounts`, `GET /api/accounts/{id}`, `GET /api/accounts/number/{accountNumber}`, `GET /api/accounts/customer/{customerId}`)
+- Customer registration and retrieval APIs (`/api/customers`)
+- Account management APIs (`/api/accounts`)
+- Core banking transaction APIs (`POST /api/transactions/deposit`, `POST /api/transactions/withdraw`, `POST /api/transactions/transfer`, `GET /api/transactions/{transactionId}`, `GET /api/transactions/account/{accountId}`)
+- Idempotent duplicate transaction ID protection, transaction audit logging, and failed/rejected transaction persistence
 - Request validation and centralized JSON error handling (`GlobalExceptionHandler`)
-- Unit, WebMVC slice, and PostgreSQL integration tests for Customer and Account modules
+- Unit, WebMVC slice, and PostgreSQL integration tests for Customer, Account, and Transaction modules
 
 Planned for upcoming stages (not yet implemented):
-- Deposits, withdrawals, and fund transfers
-- Concurrent transaction processing (`ExecutorService`) and duplicate transaction prevention
-- Transaction audit and failed transaction tracking
-- SQL reports and performance testing
+- Concurrent transaction processing (`ExecutorService`) and pessimistic/optimistic locking stress tests
+- SQL reports and performance benchmarking
 - React.js + Tailwind CSS frontend
 
 ## Current Architecture
@@ -52,6 +52,7 @@ The backend follows a layered architecture:
    ```bash
    psql -U postgres -d banking_db -f database/ddl/001_create_customers.sql
    psql -U postgres -d banking_db -f database/ddl/002_create_accounts.sql
+   psql -U postgres -d banking_db -f database/ddl/003_create_transactions.sql
    ```
    `spring.jpa.hibernate.ddl-auto` is set to `none`, so schema management is handled explicitly through SQL scripts in `database/ddl/`.
 
@@ -159,6 +160,70 @@ The backend runs on `http://localhost:8080`.
   cd backend
   .\mvnw.cmd clean test
   ```
+
+### Transaction APIs
+
+#### Transaction Lifecycle
+1. **Validation & Idempotency:** Request payload is validated (`amount > 0`, at most 2 decimal places, valid account IDs, source != destination for transfers). If `transactionId` is omitted, the server generates `TXN-<UUID>`; if `transactionId` already exists, the request is rejected with `409 Conflict` without modifying balances.
+2. **Account & Balance Checks:** Target accounts must exist (`404 Not Found`) and be `ACTIVE` (`409 Conflict` -> recorded as `REJECTED`). Debits must not exceed balance (`422 Unprocessable Content` -> recorded as `FAILED`).
+3. **Persistence:**
+   - Successful operations update account balance(s) and save a `SUCCESS` row in `bank_transactions` plus an audit entry in `transaction_audits` inside the same database transaction.
+   - Failed/rejected business operations leave account balances untouched while recording the `FAILED`/`REJECTED` transaction, an audit entry, and a categorized `failed_transactions` record.
+
+#### Endpoints
+- `POST /api/transactions/deposit` — Deposit money (`201 Created`)
+  ```json
+  {
+    "transactionId": "TXN-20261126-001",
+    "accountId": 1,
+    "amount": 500.00,
+    "description": "Salary deposit"
+  }
+  ```
+- `POST /api/transactions/withdraw` — Withdraw money (`201 Created`, `422 Unprocessable Content` if insufficient balance)
+  ```json
+  {
+    "transactionId": "TXN-20261126-002",
+    "accountId": 1,
+    "amount": 200.00,
+    "description": "ATM withdrawal"
+  }
+  ```
+- `POST /api/transactions/transfer` — Transfer between two distinct accounts (`201 Created`, `400 Bad Request` if source == destination)
+  ```json
+  {
+    "transactionId": "TXN-20261126-003",
+    "sourceAccountId": 1,
+    "destinationAccountId": 2,
+    "amount": 300.00,
+    "description": "Rent transfer"
+  }
+  ```
+  - Example response (`201 Created`):
+    ```json
+    {
+      "id": 3,
+      "transactionId": "TXN-20261126-003",
+      "transactionType": "TRANSFER",
+      "amount": 300.00,
+      "sourceAccountId": 1,
+      "sourceAccountNumber": "NG1000000001",
+      "destinationAccountId": 2,
+      "destinationAccountNumber": "NG1000000002",
+      "status": "SUCCESS",
+      "description": "Rent transfer",
+      "failureReason": null,
+      "createdAt": "2026-11-26T10:35:00.123456"
+    }
+    ```
+- `GET /api/transactions/{transactionId}` — Retrieve a transaction by its unique `transactionId` (`200 OK`, `404 Not Found`)
+- `GET /api/transactions/account/{accountId}?page=0&size=20&sortBy=createdAt&sortDir=desc` — Paginated transaction history for an account (`200 OK`, `404 Not Found` if account missing)
+
+### Running Transaction Tests
+```powershell
+cd backend
+.\mvnw.cmd test "-Dtest=TransactionServiceTest,TransactionControllerTest"
+```
 
 ## Project Structure
 
