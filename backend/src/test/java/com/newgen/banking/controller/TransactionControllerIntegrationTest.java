@@ -13,6 +13,7 @@ import com.newgen.banking.repository.BankTransactionRepository;
 import com.newgen.banking.repository.CustomerRepository;
 import com.newgen.banking.repository.FailedTransactionRepository;
 import com.newgen.banking.repository.TransactionAuditRepository;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -21,7 +22,6 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
-import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.util.List;
@@ -34,12 +34,38 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
- * Full-stack integration tests verifying balances, transactions, audits, failures, and DB constraints in banking_test_db.
+ * Full-stack integration tests verifying balances, transactions, audits, failures, and DB
+ * constraints in banking_test_db.
+ *
+ * <h2>Why NO @Transactional on the test class</h2>
+ * <p>
+ * {@link com.newgen.banking.service.TransactionRecordingService} uses
+ * {@code Propagation.REQUIRES_NEW} to write audit and failure records in an independent
+ * transaction so they survive even when the outer service transaction rolls back.
+ * </p>
+ * <p>
+ * If the test class were annotated {@code @Transactional}, Spring would wrap each test
+ * in an uncommitted test transaction and roll it back after the test. That uncommitted
+ * transaction would hold the account rows, but {@code REQUIRES_NEW} opens a brand-new
+ * database connection — and PostgreSQL's READ COMMITTED isolation means that new
+ * connection <em>cannot see rows from an uncommitted transaction</em>.
+ * </p>
+ * <p>
+ * The result: foreign key violations (SQLState 23503) on
+ * {@code fk_bank_transactions_dest_account} / {@code fk_bank_transactions_source_account}
+ * because the new connection tries to reference account IDs that don't yet exist in its
+ * view of the database.
+ * </p>
+ * <p>
+ * <b>Fix:</b> Do not annotate the test class with {@code @Transactional}. Instead, use
+ * {@link AfterEach} to delete the data written during each test so the database stays
+ * clean for the next test. Customers and accounts are committed immediately by
+ * {@code saveAndFlush}, so every connection (including REQUIRES_NEW ones) can see them.
+ * </p>
  */
 @SpringBootTest
 @AutoConfigureMockMvc
 @ActiveProfiles("test")
-@Transactional
 class TransactionControllerIntegrationTest {
 
     @Autowired
@@ -59,6 +85,21 @@ class TransactionControllerIntegrationTest {
 
     @Autowired
     private FailedTransactionRepository failedTransactionRepository;
+
+    /**
+     * Delete data in FK-safe order after every test.
+     * transaction_audits → failed_transactions → bank_transactions → accounts → customers
+     */
+    @AfterEach
+    void cleanUp() {
+        transactionAuditRepository.deleteAll();
+        failedTransactionRepository.deleteAll();
+        bankTransactionRepository.deleteAll();
+        accountRepository.deleteAll();
+        customerRepository.deleteAll();
+    }
+
+    // ── Tests ─────────────────────────────────────────────────────────────────
 
     @Test
     void depositAndWithdraw_ShouldUpdateBalancesAndPersistTransactionAndAudit() throws Exception {
@@ -104,7 +145,8 @@ class TransactionControllerIntegrationTest {
         Account afterWithdraw = accountRepository.findById(account.getId()).orElseThrow();
         assertEquals(new BigDecimal("1200.00"), afterWithdraw.getBalance());
 
-        List<TransactionAudit> audits = transactionAuditRepository.findByTransactionIdOrderByEventTimestampAsc("IT-WDR-001");
+        List<TransactionAudit> audits =
+                transactionAuditRepository.findByTransactionIdOrderByEventTimestampAsc("IT-WDR-001");
         assertEquals(1, audits.size());
         assertEquals(TransactionStatus.SUCCESS, audits.get(0).getEventStatus());
     }
@@ -128,13 +170,17 @@ class TransactionControllerIntegrationTest {
                 .andExpect(status().isUnprocessableContent())
                 .andExpect(jsonPath("$.status").value(422));
 
+        // Balance must be unchanged
         Account unchanged = accountRepository.findById(account.getId()).orElseThrow();
         assertEquals(new BigDecimal("250.00"), unchanged.getBalance());
 
-        BankTransaction failedTx = bankTransactionRepository.findByTransactionId("IT-WDR-FAIL-001").orElseThrow();
+        // Failure record must have been committed (by REQUIRES_NEW)
+        BankTransaction failedTx =
+                bankTransactionRepository.findByTransactionId("IT-WDR-FAIL-001").orElseThrow();
         assertEquals(TransactionStatus.FAILED, failedTx.getStatus());
 
-        FailedTransaction failedDetail = failedTransactionRepository.findByTransactionId("IT-WDR-FAIL-001").orElseThrow();
+        FailedTransaction failedDetail =
+                failedTransactionRepository.findByTransactionId("IT-WDR-FAIL-001").orElseThrow();
         assertEquals("INSUFFICIENT_BALANCE", failedDetail.getErrorCategory());
     }
 
@@ -157,13 +203,17 @@ class TransactionControllerIntegrationTest {
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.status").value(409));
 
+        // Balance must be unchanged
         Account unchanged = accountRepository.findById(frozen.getId()).orElseThrow();
         assertEquals(new BigDecimal("400.00"), unchanged.getBalance());
 
-        BankTransaction rejectedTx = bankTransactionRepository.findByTransactionId("IT-DEP-FROZEN-001").orElseThrow();
+        // Rejected record must have been committed (by REQUIRES_NEW)
+        BankTransaction rejectedTx =
+                bankTransactionRepository.findByTransactionId("IT-DEP-FROZEN-001").orElseThrow();
         assertEquals(TransactionStatus.REJECTED, rejectedTx.getStatus());
 
-        FailedTransaction failedDetail = failedTransactionRepository.findByTransactionId("IT-DEP-FROZEN-001").orElseThrow();
+        FailedTransaction failedDetail =
+                failedTransactionRepository.findByTransactionId("IT-DEP-FROZEN-001").orElseThrow();
         assertEquals("INACTIVE_ACCOUNT", failedDetail.getErrorCategory());
     }
 
@@ -217,8 +267,10 @@ class TransactionControllerIntegrationTest {
                 .andExpect(jsonPath("$.sourceAccountId").value(source.getId()))
                 .andExpect(jsonPath("$.destinationAccountId").value(destination.getId()));
 
-        assertEquals(new BigDecimal("1250.00"), accountRepository.findById(source.getId()).orElseThrow().getBalance());
-        assertEquals(new BigDecimal("1250.00"), accountRepository.findById(destination.getId()).orElseThrow().getBalance());
+        assertEquals(new BigDecimal("1250.00"),
+                accountRepository.findById(source.getId()).orElseThrow().getBalance());
+        assertEquals(new BigDecimal("1250.00"),
+                accountRepository.findById(destination.getId()).orElseThrow().getBalance());
 
         mockMvc.perform(get("/api/transactions/IT-TRF-001"))
                 .andExpect(status().isOk())
@@ -255,7 +307,8 @@ class TransactionControllerIntegrationTest {
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.status").value(400));
 
-        assertEquals(new BigDecimal("500.00"), accountRepository.findById(account.getId()).orElseThrow().getBalance());
+        assertEquals(new BigDecimal("500.00"),
+                accountRepository.findById(account.getId()).orElseThrow().getBalance());
     }
 
     @Test
@@ -270,9 +323,16 @@ class TransactionControllerIntegrationTest {
         invalidAmount.setDestinationAccount(account);
         invalidAmount.setStatus(TransactionStatus.SUCCESS);
 
-        assertThrows(DataIntegrityViolationException.class, () -> bankTransactionRepository.saveAndFlush(invalidAmount));
+        assertThrows(DataIntegrityViolationException.class,
+                () -> bankTransactionRepository.saveAndFlush(invalidAmount));
     }
 
+    // ── Fixture helpers ───────────────────────────────────────────────────────
+
+    /**
+     * Saves and flushes a customer so it is immediately visible to all DB connections.
+     * Not wrapped in a test transaction — the row is committed on return.
+     */
     private Customer saveCustomer(String fullName, String email) {
         Customer customer = new Customer();
         customer.setFullName(fullName);
@@ -281,6 +341,10 @@ class TransactionControllerIntegrationTest {
         return customerRepository.saveAndFlush(customer);
     }
 
+    /**
+     * Saves and flushes an account so it is immediately visible to all DB connections,
+     * including REQUIRES_NEW transactions opened by TransactionRecordingService.
+     */
     private Account saveAccount(Customer customer, BigDecimal balance, AccountStatus status) {
         Long seq = accountRepository.getNextAccountNumberSequence();
         Account account = new Account();

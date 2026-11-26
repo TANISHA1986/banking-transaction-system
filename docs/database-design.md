@@ -172,3 +172,19 @@ erDiagram
         timestamp failed_at
     }
 ```
+
+## 7. Concurrency and Locking Notes
+
+Balance columns in the `accounts` table are protected by **pessimistic write locks**
+(`SELECT … FOR UPDATE`) during every deposit, withdrawal, and transfer operation.
+
+- The application issues `findByIdForUpdate` (single account) or `findByIdsForUpdate`
+  (transfer — ordered by `id ASC`) to acquire the row-level lock before reading
+  or modifying the balance.
+- Locks are held for the duration of the enclosing `@Transactional` method and
+  released on commit or rollback.
+- Transfer operations always lock the lower account ID first, then the higher ID,
+  preventing circular-wait deadlocks.
+
+See [`docs/concurrency-design.md`](concurrency-design.md) for the full design
+rationale, flow diagrams, and test coverage.

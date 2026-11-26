@@ -8,4 +8,8 @@ public class DuplicateTransactionException extends DuplicateResourceException {
     public DuplicateTransactionException(String message) {
         super(message);
     }
+
+    public DuplicateTransactionException(String message, Throwable cause) {
+        super(message, cause);
+    }
 }

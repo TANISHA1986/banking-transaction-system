@@ -4,7 +4,7 @@
 
 This project is a Java, Spring Boot, and PostgreSQL banking transaction processing system designed to support customer and account management, deposits, withdrawals, fund transfers, concurrent transaction processing, and audit/failure tracking.
 
-## Current Implementation Status (Day 3 Core Transactions)
+## Current Implementation Status (Day 4 — Concurrency Control)
 
 Currently implemented:
 - Spring Boot Maven backend skeleton (`banking-system`)
@@ -16,11 +16,21 @@ Currently implemented:
 - Idempotent duplicate transaction ID protection, transaction audit logging, and failed/rejected transaction persistence
 - Request validation and centralized JSON error handling (`GlobalExceptionHandler`)
 - Unit, WebMVC slice, and PostgreSQL integration tests for Customer, Account, and Transaction modules
+- **Pessimistic write locking (`SELECT … FOR UPDATE`)** on all balance-mutating operations — prevents lost updates and negative balances under concurrent load
+- **Ordered lock acquisition for transfers** — both accounts always locked in ascending ID order, eliminating deadlocks
+- **`TransactionRecordingService` with `Propagation.REQUIRES_NEW`** — failure and audit records commit independently, surviving outer transaction rollback
+- **`TransactionConcurrencyTest`** — PostgreSQL integration tests proving correct behaviour under simultaneous requests (concurrent deposits, withdrawals, duplicate IDs, opposite-direction transfers)
 
 Planned for upcoming stages (not yet implemented):
-- Concurrent transaction processing (`ExecutorService`) and pessimistic/optimistic locking stress tests
 - SQL reports and performance benchmarking
 - React.js + Tailwind CSS frontend
+
+## Concurrency Design
+
+All balance-mutating operations (`deposit`, `withdraw`, `transfer`) use **pessimistic
+write locking** (`SELECT … FOR UPDATE`) to serialise concurrent access to the same
+account row. Full design rationale and flow diagrams are in
+[`docs/concurrency-design.md`](docs/concurrency-design.md).
 
 ## Current Architecture
 

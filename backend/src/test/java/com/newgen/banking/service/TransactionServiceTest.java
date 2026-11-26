@@ -10,8 +10,6 @@ import com.newgen.banking.entity.AccountStatus;
 import com.newgen.banking.entity.AccountType;
 import com.newgen.banking.entity.BankTransaction;
 import com.newgen.banking.entity.Customer;
-import com.newgen.banking.entity.FailedTransaction;
-import com.newgen.banking.entity.TransactionAudit;
 import com.newgen.banking.entity.TransactionStatus;
 import com.newgen.banking.entity.TransactionType;
 import com.newgen.banking.exception.AccountNotFoundException;
@@ -21,8 +19,6 @@ import com.newgen.banking.exception.InsufficientBalanceException;
 import com.newgen.banking.exception.TransactionNotFoundException;
 import com.newgen.banking.repository.AccountRepository;
 import com.newgen.banking.repository.BankTransactionRepository;
-import com.newgen.banking.repository.FailedTransactionRepository;
-import com.newgen.banking.repository.TransactionAuditRepository;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
@@ -47,6 +43,17 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+/**
+ * Unit tests for {@link TransactionService}.
+ *
+ * <p>After the Day 4 refactor, {@link TransactionService} no longer injects
+ * {@code TransactionAuditRepository} or {@code FailedTransactionRepository} directly.
+ * All failure/audit recording is delegated to {@link TransactionRecordingService}
+ * (which uses {@code Propagation.REQUIRES_NEW}). Tests mock that recorder instead.</p>
+ *
+ * <p>Account reads now go through {@code findByIdForUpdate} (pessimistic write lock)
+ * or {@code findByIdsForUpdate} (transfer). The mocks here stub those locked variants.</p>
+ */
 @ExtendWith(MockitoExtension.class)
 class TransactionServiceTest {
 
@@ -56,14 +63,17 @@ class TransactionServiceTest {
     @Mock
     private BankTransactionRepository bankTransactionRepository;
 
+    /**
+     * Mocked recorder — records success/failure in REQUIRES_NEW transactions.
+     * Individual recording calls are verified by argument type, not by deep repository calls.
+     */
     @Mock
-    private TransactionAuditRepository transactionAuditRepository;
-
-    @Mock
-    private FailedTransactionRepository failedTransactionRepository;
+    private TransactionRecordingService recorder;
 
     @InjectMocks
     private TransactionService transactionService;
+
+    // ── Deposit ──────────────────────────────────────────────────────────────
 
     @Test
     void deposit_ShouldCreditAccountAndRecordSuccess_WhenAccountIsActive() {
@@ -71,8 +81,8 @@ class TransactionServiceTest {
         DepositRequest request = new DepositRequest("TXN-DEP-1", 1L, new BigDecimal("500.5"), "Salary credit");
 
         when(bankTransactionRepository.existsByTransactionId("TXN-DEP-1")).thenReturn(false);
-        when(accountRepository.findWithCustomerById(1L)).thenReturn(Optional.of(account));
-        stubTransactionSave();
+        when(accountRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(account));
+        stubRecorderSuccess("TXN-DEP-1", TransactionType.DEPOSIT, new BigDecimal("500.50"), null, account);
 
         TransactionResponse response = transactionService.deposit(request);
 
@@ -85,9 +95,42 @@ class TransactionServiceTest {
         assertEquals(1L, response.destinationAccountId());
 
         verify(accountRepository).save(account);
-        verify(transactionAuditRepository).save(any(TransactionAudit.class));
-        verify(failedTransactionRepository, never()).save(any());
+        verify(recorder).recordSuccess(
+                eq("TXN-DEP-1"), eq(TransactionType.DEPOSIT), eq(new BigDecimal("500.50")),
+                eq(null), eq(account), any(), any(Long.class), any());
+        verify(recorder, never()).recordFailure(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(Long.class));
     }
+
+    @Test
+    void deposit_ShouldThrowInactiveAccountAndRecordRejected_WhenAccountIsNotActive() {
+        Account frozen = buildAccount(1L, "NG1000000001", new BigDecimal("500.00"), AccountStatus.FROZEN);
+        DepositRequest request = new DepositRequest("TXN-FROZEN", 1L, new BigDecimal("100.00"), null);
+
+        when(bankTransactionRepository.existsByTransactionId("TXN-FROZEN")).thenReturn(false);
+        when(accountRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(frozen));
+
+        assertThrows(InactiveAccountException.class, () -> transactionService.deposit(request));
+
+        assertEquals(new BigDecimal("500.00"), frozen.getBalance());
+        verify(accountRepository, never()).save(any());
+        verify(recorder).recordFailure(
+                eq("TXN-FROZEN"), eq(TransactionType.DEPOSIT), eq(new BigDecimal("100.00")),
+                eq(null), eq(frozen), eq(TransactionStatus.REJECTED), any(), eq("INACTIVE_ACCOUNT"), any(), any(Long.class));
+    }
+
+    @Test
+    void deposit_ShouldThrowDuplicateTransactionException_WhenTransactionIdAlreadyExists() {
+        DepositRequest request = new DepositRequest("TXN-DUP", 1L, new BigDecimal("100.00"), null);
+        when(bankTransactionRepository.existsByTransactionId("TXN-DUP")).thenReturn(true);
+
+        assertThrows(DuplicateTransactionException.class, () -> transactionService.deposit(request));
+
+        verify(accountRepository, never()).findByIdForUpdate(any());
+        verify(accountRepository, never()).save(any());
+        verify(recorder, never()).recordSuccess(any(), any(), any(), any(), any(), any(), any(Long.class), any());
+    }
+
+    // ── Withdrawal ───────────────────────────────────────────────────────────
 
     @Test
     void withdraw_ShouldDebitAccountAndRecordSuccess_WhenBalanceIsSufficient() {
@@ -95,8 +138,8 @@ class TransactionServiceTest {
         WithdrawalRequest request = new WithdrawalRequest("TXN-WDR-1", 1L, new BigDecimal("250.25"), "ATM cash");
 
         when(bankTransactionRepository.existsByTransactionId("TXN-WDR-1")).thenReturn(false);
-        when(accountRepository.findWithCustomerById(1L)).thenReturn(Optional.of(account));
-        stubTransactionSave();
+        when(accountRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(account));
+        stubRecorderSuccess("TXN-WDR-1", TransactionType.WITHDRAWAL, new BigDecimal("250.25"), account, null);
 
         TransactionResponse response = transactionService.withdraw(request);
 
@@ -107,7 +150,9 @@ class TransactionServiceTest {
         assertNull(response.destinationAccountId());
 
         verify(accountRepository).save(account);
-        verify(transactionAuditRepository).save(any(TransactionAudit.class));
+        verify(recorder).recordSuccess(
+                eq("TXN-WDR-1"), eq(TransactionType.WITHDRAWAL), eq(new BigDecimal("250.25")),
+                eq(account), eq(null), any(), any(Long.class), any());
     }
 
     @Test
@@ -116,59 +161,18 @@ class TransactionServiceTest {
         WithdrawalRequest request = new WithdrawalRequest("TXN-WDR-FAIL", 1L, new BigDecimal("500.00"), "Rent");
 
         when(bankTransactionRepository.existsByTransactionId("TXN-WDR-FAIL")).thenReturn(false);
-        when(accountRepository.findWithCustomerById(1L)).thenReturn(Optional.of(account));
-        stubTransactionSave();
+        when(accountRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(account));
 
         assertThrows(InsufficientBalanceException.class, () -> transactionService.withdraw(request));
 
         assertEquals(new BigDecimal("200.00"), account.getBalance());
         verify(accountRepository, never()).save(any());
-
-        ArgumentCaptor<BankTransaction> txCaptor = ArgumentCaptor.forClass(BankTransaction.class);
-        verify(bankTransactionRepository).save(txCaptor.capture());
-        assertEquals(TransactionStatus.FAILED, txCaptor.getValue().getStatus());
-
-        ArgumentCaptor<FailedTransaction> failedCaptor = ArgumentCaptor.forClass(FailedTransaction.class);
-        verify(failedTransactionRepository).save(failedCaptor.capture());
-        assertEquals("INSUFFICIENT_BALANCE", failedCaptor.getValue().getErrorCategory());
-        verify(transactionAuditRepository).save(any(TransactionAudit.class));
+        verify(recorder).recordFailure(
+                eq("TXN-WDR-FAIL"), eq(TransactionType.WITHDRAWAL), eq(new BigDecimal("500.00")),
+                eq(account), eq(null), eq(TransactionStatus.FAILED), any(), eq("INSUFFICIENT_BALANCE"), any(), any(Long.class));
     }
 
-    @Test
-    void operations_ShouldRejectInvalidAmount_WithoutModifyingAccounts() {
-        assertThrows(IllegalArgumentException.class,
-                () -> transactionService.deposit(new DepositRequest("TXN-1", 1L, BigDecimal.ZERO, null)));
-        assertThrows(IllegalArgumentException.class,
-                () -> transactionService.withdraw(new WithdrawalRequest("TXN-2", 1L, new BigDecimal("-10.00"), null)));
-        assertThrows(IllegalArgumentException.class,
-                () -> transactionService.transfer(new TransferRequest("TXN-3", 1L, 2L, new BigDecimal("10.999"), null)));
-
-        verify(accountRepository, never()).save(any());
-        verify(bankTransactionRepository, never()).save(any());
-    }
-
-    @Test
-    void deposit_ShouldThrowInactiveAccountAndRecordRejected_WhenAccountIsNotActive() {
-        Account frozen = buildAccount(1L, "NG1000000001", new BigDecimal("500.00"), AccountStatus.FROZEN);
-        DepositRequest request = new DepositRequest("TXN-FROZEN", 1L, new BigDecimal("100.00"), null);
-
-        when(bankTransactionRepository.existsByTransactionId("TXN-FROZEN")).thenReturn(false);
-        when(accountRepository.findWithCustomerById(1L)).thenReturn(Optional.of(frozen));
-        stubTransactionSave();
-
-        assertThrows(InactiveAccountException.class, () -> transactionService.deposit(request));
-
-        assertEquals(new BigDecimal("500.00"), frozen.getBalance());
-        verify(accountRepository, never()).save(any());
-
-        ArgumentCaptor<BankTransaction> txCaptor = ArgumentCaptor.forClass(BankTransaction.class);
-        verify(bankTransactionRepository).save(txCaptor.capture());
-        assertEquals(TransactionStatus.REJECTED, txCaptor.getValue().getStatus());
-
-        ArgumentCaptor<FailedTransaction> failedCaptor = ArgumentCaptor.forClass(FailedTransaction.class);
-        verify(failedTransactionRepository).save(failedCaptor.capture());
-        assertEquals("INACTIVE_ACCOUNT", failedCaptor.getValue().getErrorCategory());
-    }
+    // ── Transfer ─────────────────────────────────────────────────────────────
 
     @Test
     void transfer_ShouldUpdateBothAccountsAndRecordSuccess_WhenValid() {
@@ -177,9 +181,9 @@ class TransactionServiceTest {
         TransferRequest request = new TransferRequest("TXN-TRF-1", 1L, 2L, new BigDecimal("400.00"), "Savings move");
 
         when(bankTransactionRepository.existsByTransactionId("TXN-TRF-1")).thenReturn(false);
-        when(accountRepository.findWithCustomerById(1L)).thenReturn(Optional.of(source));
-        when(accountRepository.findWithCustomerById(2L)).thenReturn(Optional.of(destination));
-        stubTransactionSave();
+        // Transfer uses findByIdsForUpdate(List.of(1,2)) — ordered by ID ASC
+        when(accountRepository.findByIdsForUpdate(List.of(1L, 2L))).thenReturn(List.of(source, destination));
+        stubRecorderSuccess("TXN-TRF-1", TransactionType.TRANSFER, new BigDecimal("400.00"), source, destination);
 
         TransactionResponse response = transactionService.transfer(request);
 
@@ -191,24 +195,28 @@ class TransactionServiceTest {
         assertEquals(2L, response.destinationAccountId());
 
         verify(accountRepository, times(2)).save(any(Account.class));
-        verify(transactionAuditRepository).save(any(TransactionAudit.class));
+        verify(recorder).recordSuccess(
+                eq("TXN-TRF-1"), eq(TransactionType.TRANSFER), eq(new BigDecimal("400.00")),
+                eq(source), eq(destination), any(), any(Long.class), any());
     }
 
     @Test
-    void transfer_ShouldThrowAccountNotFoundAndRecordRejected_WhenDestinationMissing() {
-        Account source = buildAccount(1L, "NG1000000001", new BigDecimal("1000.00"), AccountStatus.ACTIVE);
-        TransferRequest request = new TransferRequest("TXN-TRF-MISSING", 1L, 99L, new BigDecimal("100.00"), null);
+    void transfer_ShouldThrowAccountNotFoundAndRecordRejected_WhenSourceMissing() {
+        // Source ID=99 does not exist; destination ID=1 does not matter because source is not found
+        TransferRequest request = new TransferRequest("TXN-TRF-MISSING", 99L, 1L, new BigDecimal("100.00"), null);
 
         when(bankTransactionRepository.existsByTransactionId("TXN-TRF-MISSING")).thenReturn(false);
-        when(accountRepository.findWithCustomerById(1L)).thenReturn(Optional.of(source));
-        when(accountRepository.findWithCustomerById(99L)).thenReturn(Optional.empty());
-        stubTransactionSave();
+        // findByIdsForUpdate(List.of(1,99)) returns only account 1 (source 99 is missing)
+        Account destination = buildAccount(1L, "NG1000000001", new BigDecimal("1000.00"), AccountStatus.ACTIVE);
+        when(accountRepository.findByIdsForUpdate(List.of(1L, 99L))).thenReturn(List.of(destination));
 
         assertThrows(AccountNotFoundException.class, () -> transactionService.transfer(request));
 
-        assertEquals(new BigDecimal("1000.00"), source.getBalance());
         verify(accountRepository, never()).save(any());
-        verify(failedTransactionRepository).save(any(FailedTransaction.class));
+        // A REJECTED failure record should be written for source not found
+        verify(recorder).recordFailure(
+                eq("TXN-TRF-MISSING"), eq(TransactionType.TRANSFER), eq(new BigDecimal("100.00")),
+                eq(null), eq(null), eq(TransactionStatus.REJECTED), any(), eq("ACCOUNT_NOT_FOUND"), any(), any(Long.class));
     }
 
     @Test
@@ -216,21 +224,43 @@ class TransactionServiceTest {
         TransferRequest request = new TransferRequest("TXN-SAME", 1L, 1L, new BigDecimal("50.00"), null);
 
         assertThrows(IllegalArgumentException.class, () -> transactionService.transfer(request));
-        verify(accountRepository, never()).findWithCustomerById(any());
-        verify(bankTransactionRepository, never()).save(any());
+        verify(accountRepository, never()).findByIdsForUpdate(any());
+        verify(recorder, never()).recordSuccess(any(), any(), any(), any(), any(), any(), any(Long.class), any());
     }
 
     @Test
-    void deposit_ShouldThrowDuplicateTransactionException_WhenTransactionIdAlreadyExists() {
-        DepositRequest request = new DepositRequest("TXN-DUP", 1L, new BigDecimal("100.00"), null);
-        when(bankTransactionRepository.existsByTransactionId("TXN-DUP")).thenReturn(true);
+    void transfer_ShouldThrowInsufficientBalance_WhenSourceBalanceTooLow() {
+        Account source = buildAccount(1L, "NG1000000001", new BigDecimal("50.00"), AccountStatus.ACTIVE);
+        Account destination = buildAccount(2L, "NG1000000002", new BigDecimal("300.00"), AccountStatus.ACTIVE);
+        TransferRequest request = new TransferRequest("TXN-TRF-NSF", 1L, 2L, new BigDecimal("200.00"), null);
 
-        assertThrows(DuplicateTransactionException.class, () -> transactionService.deposit(request));
+        when(bankTransactionRepository.existsByTransactionId("TXN-TRF-NSF")).thenReturn(false);
+        when(accountRepository.findByIdsForUpdate(List.of(1L, 2L))).thenReturn(List.of(source, destination));
 
-        verify(accountRepository, never()).findWithCustomerById(any());
+        assertThrows(InsufficientBalanceException.class, () -> transactionService.transfer(request));
+
         verify(accountRepository, never()).save(any());
-        verify(bankTransactionRepository, never()).save(any());
+        verify(recorder).recordFailure(
+                eq("TXN-TRF-NSF"), eq(TransactionType.TRANSFER), eq(new BigDecimal("200.00")),
+                eq(source), eq(destination), eq(TransactionStatus.FAILED), any(), eq("INSUFFICIENT_BALANCE"), any(), any(Long.class));
     }
+
+    // ── Validation ───────────────────────────────────────────────────────────
+
+    @Test
+    void operations_ShouldRejectInvalidAmount_WithoutModifyingAccounts() {
+        assertThrows(IllegalArgumentException.class,
+                () -> transactionService.deposit(new DepositRequest("TXN-1", 1L, BigDecimal.ZERO, null)));
+        assertThrows(IllegalArgumentException.class,
+                () -> transactionService.withdraw(new WithdrawalRequest("TXN-2", 1L, new BigDecimal("-10.00"), null)));
+        assertThrows(IllegalArgumentException.class,
+                () -> transactionService.transfer(new TransferRequest("TXN-3", 1L, 2L, new BigDecimal("10.999"), null)));
+
+        verify(accountRepository, never()).save(any());
+        verify(recorder, never()).recordSuccess(any(), any(), any(), any(), any(), any(), any(Long.class), any());
+    }
+
+    // ── Query / Lookup ────────────────────────────────────────────────────────
 
     @Test
     void lookupMethods_ShouldReturnTransactionAndAccountHistory_OrThrowNotFound() {
@@ -265,17 +295,33 @@ class TransactionServiceTest {
                 () -> transactionService.getTransactionsByAccountId(99L, 0, 20, "createdAt", "desc"));
     }
 
-    private void stubTransactionSave() {
-        when(bankTransactionRepository.save(any(BankTransaction.class))).thenAnswer(invocation -> {
-            BankTransaction tx = invocation.getArgument(0);
-            if (tx.getId() == null) {
-                tx.setId(100L);
-            }
-            if (tx.getCreatedAt() == null) {
-                tx.setCreatedAt(LocalDateTime.of(2026, 11, 26, 10, 30));
-            }
-            return tx;
-        });
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /**
+     * Stubs {@code recorder.recordSuccess(...)} to return a minimal {@link BankTransaction}
+     * with enough fields set for {@link TransactionResponse#from} to work.
+     */
+    private void stubRecorderSuccess(
+            String txId,
+            TransactionType type,
+            BigDecimal amount,
+            Account source,
+            Account destination) {
+        when(recorder.recordSuccess(
+                eq(txId), eq(type), eq(amount),
+                eq(source), eq(destination), any(), any(Long.class), any()))
+                .thenAnswer(invocation -> {
+                    BankTransaction tx = new BankTransaction();
+                    tx.setId(100L);
+                    tx.setTransactionId(txId);
+                    tx.setTransactionType(type);
+                    tx.setAmount(amount);
+                    tx.setSourceAccount(source);
+                    tx.setDestinationAccount(destination);
+                    tx.setStatus(TransactionStatus.SUCCESS);
+                    tx.setCreatedAt(LocalDateTime.of(2026, 11, 26, 10, 30));
+                    return tx;
+                });
     }
 
     private static Account buildAccount(Long id, String accountNumber, BigDecimal balance, AccountStatus status) {
