@@ -41,7 +41,6 @@ public interface AccountRepository extends JpaRepository<Account, Long> {
      * The calling method MUST be inside an active @Transactional context.
      */
     @Lock(LockModeType.PESSIMISTIC_WRITE)
-    @EntityGraph(attributePaths = "customer")
     @Query("SELECT a FROM Account a WHERE a.id = :id")
     Optional<Account> findByIdForUpdate(@Param("id") Long id);
 
@@ -53,7 +52,6 @@ public interface AccountRepository extends JpaRepository<Account, Long> {
      * The calling method MUST be inside an active @Transactional context.
      */
     @Lock(LockModeType.PESSIMISTIC_WRITE)
-    @EntityGraph(attributePaths = "customer")
     @Query("SELECT a FROM Account a WHERE a.id IN :ids ORDER BY a.id ASC")
     List<Account> findByIdsForUpdate(@Param("ids") List<Long> ids);
 }

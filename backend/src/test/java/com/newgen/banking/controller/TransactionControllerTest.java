@@ -13,6 +13,7 @@ import com.newgen.banking.exception.GlobalExceptionHandler;
 import com.newgen.banking.exception.InactiveAccountException;
 import com.newgen.banking.exception.InsufficientBalanceException;
 import com.newgen.banking.exception.TransactionNotFoundException;
+import com.newgen.banking.service.BatchTransactionService;
 import com.newgen.banking.service.TransactionService;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -44,6 +45,9 @@ class TransactionControllerTest {
 
     @MockitoBean
     private TransactionService transactionService;
+
+    @MockitoBean
+    private BatchTransactionService batchTransactionService;
 
     @Test
     void deposit_ShouldReturn201_WhenValid() throws Exception {

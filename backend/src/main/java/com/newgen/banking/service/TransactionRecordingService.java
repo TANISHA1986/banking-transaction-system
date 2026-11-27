@@ -6,11 +6,13 @@ import com.newgen.banking.entity.FailedTransaction;
 import com.newgen.banking.entity.TransactionAudit;
 import com.newgen.banking.entity.TransactionStatus;
 import com.newgen.banking.entity.TransactionType;
+import com.newgen.banking.exception.DuplicateTransactionException;
 import com.newgen.banking.repository.BankTransactionRepository;
 import com.newgen.banking.repository.FailedTransactionRepository;
 import com.newgen.banking.repository.TransactionAuditRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -50,9 +52,9 @@ public class TransactionRecordingService {
 
     /**
      * Saves a successful transaction record and its audit entry.
-     * Runs in a NEW transaction so the commit is independent.
+     * Runs in the caller's transaction so balance updates and transaction records commit atomically.
      */
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    @Transactional(propagation = Propagation.REQUIRED)
     public BankTransaction recordSuccess(
             String transactionId,
             TransactionType type,
@@ -65,7 +67,7 @@ public class TransactionRecordingService {
 
         BankTransaction tx = buildTransaction(transactionId, type, amount, source, destination,
                 TransactionStatus.SUCCESS, description, null);
-        BankTransaction savedTx = bankTransactionRepository.save(tx);
+        BankTransaction savedTx = saveBankTransaction(tx);
         saveAudit(savedTx, TransactionStatus.SUCCESS, startNanos, details);
         log.info("Transaction {} ({}) committed with status SUCCESS", transactionId, type);
         return savedTx;
@@ -90,7 +92,7 @@ public class TransactionRecordingService {
 
         BankTransaction tx = buildTransaction(transactionId, type, amount, source, destination,
                 status, description, reason);
-        BankTransaction savedTx = bankTransactionRepository.save(tx);
+        BankTransaction savedTx = saveBankTransaction(tx);
         saveAudit(savedTx, status, startNanos, reason);
 
         FailedTransaction failed = new FailedTransaction();
@@ -105,6 +107,22 @@ public class TransactionRecordingService {
     }
 
     // ── private helpers ───────────────────────────────────────────────────────
+
+    private BankTransaction saveBankTransaction(BankTransaction tx) {
+        try {
+            return bankTransactionRepository.save(tx);
+        } catch (DataIntegrityViolationException ex) {
+            String msg = ex.getMessage() != null ? ex.getMessage().toLowerCase() : "";
+            if (ex.getCause() != null && ex.getCause().getMessage() != null) {
+                msg += " " + ex.getCause().getMessage().toLowerCase();
+            }
+            if (msg.contains("transaction_id") || msg.contains("uk_bank_transactions_transaction_id")) {
+                throw new DuplicateTransactionException(
+                        "Duplicate transaction request rejected for transactionId: " + tx.getTransactionId(), ex);
+            }
+            throw ex;
+        }
+    }
 
     private BankTransaction buildTransaction(
             String transactionId,

@@ -4,7 +4,7 @@
 
 This project is a Java, Spring Boot, and PostgreSQL banking transaction processing system designed to support customer and account management, deposits, withdrawals, fund transfers, concurrent transaction processing, and audit/failure tracking.
 
-## Current Implementation Status (Day 4 — Concurrency Control)
+## Current Implementation Status (Day 5 — Bounded Thread Pool & Batch Processing)
 
 Currently implemented:
 - Spring Boot Maven backend skeleton (`banking-system`)
@@ -13,6 +13,7 @@ Currently implemented:
 - Customer registration and retrieval APIs (`/api/customers`)
 - Account management APIs (`/api/accounts`)
 - Core banking transaction APIs (`POST /api/transactions/deposit`, `POST /api/transactions/withdraw`, `POST /api/transactions/transfer`, `GET /api/transactions/{transactionId}`, `GET /api/transactions/account/{accountId}`)
+- **Batch transaction API (`POST /api/transactions/batch`)** — submits up to 1,000 transactions concurrently via a bounded thread pool; returns per-item results with TPS metrics
 - Idempotent duplicate transaction ID protection, transaction audit logging, and failed/rejected transaction persistence
 - Request validation and centralized JSON error handling (`GlobalExceptionHandler`)
 - Unit, WebMVC slice, and PostgreSQL integration tests for Customer, Account, and Transaction modules
@@ -20,10 +21,9 @@ Currently implemented:
 - **Ordered lock acquisition for transfers** — both accounts always locked in ascending ID order, eliminating deadlocks
 - **`TransactionRecordingService` with `Propagation.REQUIRES_NEW`** — failure and audit records commit independently, surviving outer transaction rollback
 - **`TransactionConcurrencyTest`** — PostgreSQL integration tests proving correct behaviour under simultaneous requests (concurrent deposits, withdrawals, duplicate IDs, opposite-direction transfers)
-
-Planned for upcoming stages (not yet implemented):
-- SQL reports and performance benchmarking
-- React.js + Tailwind CSS frontend
+- **`TransactionThreadPoolExecutor`** — bounded `LinkedBlockingQueue`, named worker threads (`txn-worker-N`), `SmartLifecycle` for graceful shutdown, `TaskRejectedException` for back-pressure
+- **`BatchTransactionService`** — submits DEPOSIT / WITHDRAWAL / TRANSFER items as `Callable`s to the pool; collects `Future` results; aggregates success / failed / rejected counts
+- **`TransactionBenchmarkTest`** (`@Tag("benchmark")`) — 4 scenarios (50 / 200 / 500 / 1,000 transactions) with real DB; prints TPS report to stdout
 
 ## Concurrency Design
 
@@ -31,6 +31,11 @@ All balance-mutating operations (`deposit`, `withdraw`, `transfer`) use **pessim
 write locking** (`SELECT … FOR UPDATE`) to serialise concurrent access to the same
 account row. Full design rationale and flow diagrams are in
 [`docs/concurrency-design.md`](docs/concurrency-design.md).
+
+## Thread Pool Design
+
+The bounded thread pool architecture, configuration reference, and batch endpoint usage
+examples are documented in [`docs/thread-pool-design.md`](docs/thread-pool-design.md).
 
 ## Current Architecture
 
