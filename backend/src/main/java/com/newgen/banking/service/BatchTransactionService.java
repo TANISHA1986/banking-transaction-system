@@ -17,8 +17,10 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Queue;
 import java.util.UUID;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
@@ -80,15 +82,14 @@ public class BatchTransactionService {
     }
 
     /**
-     * Processes a batch of transaction requests concurrently.
+     * Processes a batch of transaction requests concurrently with bounded backpressure.
      *
-     * <p>Steps:</p>
-     * <ol>
-     *   <li>Generate a batch ID if not supplied.</li>
-     *   <li>Submit each valid item as a {@link java.util.concurrent.Callable} to the pool.</li>
-     *   <li>Collect all {@link Future} results (or rejections / timeouts).</li>
-     *   <li>Aggregate counts and build a {@link BatchTransactionResult}.</li>
-     * </ol>
+     * <p>A sliding window limits the number of in-flight tasks submitted to the executor
+     * to at most half of the executor's queue capacity (bounded between 1 and 100).
+     * This controlled submission ensures that large valid batches (up to 1,000 items)
+     * can be processed without saturating the bounded queue on their own, while leaving
+     * headroom for concurrent requests. If the queue becomes saturated due to genuine
+     * external load, {@link TaskRejectedException} is caught and recorded as {@link TransactionStatus#REJECTED}.</p>
      *
      * @param request the validated batch request
      * @return a full summary including per-item results and performance metrics
@@ -98,136 +99,87 @@ public class BatchTransactionService {
                 ? request.batchId()
                 : "BATCH-" + UUID.randomUUID();
 
-        List<BatchTransactionItem> items = request.transactions();
+        List<BatchTransactionItem> items = request.transactions() != null
+                ? request.transactions()
+                : List.of();
         int totalSubmitted = items.size();
 
         log.info("Batch {} started — {} transactions submitted", batchId, totalSubmitted);
         LocalDateTime startedAt = LocalDateTime.now();
         long startNanos = System.nanoTime();
 
-        // Phase 1: submit all tasks to the thread pool
-        // Each entry is either a Future or a pre-resolved rejection placeholder
-        record SubmitOutcome(Future<TransactionResponse> future, BatchTransactionItemResult rejection) {}
-        List<SubmitOutcome> outcomes = new ArrayList<>(totalSubmitted);
+        // Calculate sliding window capacity for in-flight tasks.
+        // Uses at most half of the queue capacity (capped at 100) to avoid self-saturation.
+        int queueCap = executor.getQueueCapacity();
+        int maxInFlight = (queueCap > 0) ? Math.max(1, Math.min(queueCap / 2, 100)) : 50;
 
-        for (BatchTransactionItem item : items) {
+        record InFlightTask(int index, BatchTransactionItem item, Future<TransactionResponse> future) {}
+        Queue<InFlightTask> inFlight = new ArrayDeque<>();
+        BatchTransactionItemResult[] results = new BatchTransactionItemResult[totalSubmitted];
+
+        for (int i = 0; i < totalSubmitted; i++) {
+            BatchTransactionItem item = items.get(i);
+
+            // Eagerly harvest any in-flight tasks that have already completed
+            while (!inFlight.isEmpty() && inFlight.peek().future().isDone()) {
+                InFlightTask completed = inFlight.poll();
+                resolveAndStore(completed.index(), completed.item(), completed.future(), results, batchId);
+            }
+
+            // If in-flight window is full, wait for the oldest task to finish (bounded backpressure)
+            while (inFlight.size() >= maxInFlight) {
+                InFlightTask oldest = inFlight.poll();
+                resolveAndStore(oldest.index(), oldest.item(), oldest.future(), results, batchId);
+            }
+
+            // Submit next task to executor
             try {
                 Future<TransactionResponse> future = executor.submit(buildCallable(item));
-                outcomes.add(new SubmitOutcome(future, null));
+                inFlight.add(new InFlightTask(i, item, future));
             } catch (TaskRejectedException ex) {
+                // Genuine queue saturation from concurrent external load
                 log.warn("Batch {} — task rejected (pool saturated): {}", batchId, ex.getMessage());
-                outcomes.add(new SubmitOutcome(null,
-                        BatchTransactionItemResult.failed(
-                                item.transactionId(),
-                                item.type(),
-                                item.amount(),
-                                TransactionStatus.REJECTED,
-                                "Task rejected — thread pool saturated: " + ex.getMessage()
-                        )));
+                results[i] = BatchTransactionItemResult.failed(
+                        item.transactionId(),
+                        item.type(),
+                        item.amount(),
+                        TransactionStatus.REJECTED,
+                        "Task rejected — thread pool saturated: " + ex.getMessage()
+                );
             } catch (Exception ex) {
                 log.error("Batch {} — unexpected error submitting task", batchId, ex);
-                outcomes.add(new SubmitOutcome(null,
-                        BatchTransactionItemResult.failed(
-                                item.transactionId(),
-                                item.type(),
-                                item.amount(),
-                                TransactionStatus.REJECTED,
-                                "Submission error: " + ex.getMessage()
-                        )));
+                results[i] = BatchTransactionItemResult.failed(
+                        item.transactionId(),
+                        item.type(),
+                        item.amount(),
+                        TransactionStatus.REJECTED,
+                        "Submission error: " + ex.getMessage()
+                );
             }
         }
 
-        // Phase 2: collect results
-        List<BatchTransactionItemResult> results = new ArrayList<>(totalSubmitted);
+        // Drain any remaining in-flight tasks
+        while (!inFlight.isEmpty()) {
+            InFlightTask remaining = inFlight.poll();
+            resolveAndStore(remaining.index(), remaining.item(), remaining.future(), results, batchId);
+        }
+
+        // Aggregate results and metrics
+        List<BatchTransactionItemResult> resultList = new ArrayList<>(totalSubmitted);
         int accepted = 0, rejected = 0, successful = 0, failed = 0;
 
-        for (int i = 0; i < outcomes.size(); i++) {
-            SubmitOutcome outcome = outcomes.get(i);
-            BatchTransactionItem item = items.get(i);
-
-            if (outcome.rejection() != null) {
-                // Was rejected at submission time
-                results.add(outcome.rejection());
+        for (int i = 0; i < totalSubmitted; i++) {
+            BatchTransactionItemResult itemResult = results[i];
+            resultList.add(itemResult);
+            if (itemResult.status() == TransactionStatus.REJECTED) {
                 rejected++;
-                continue;
-            }
-
-            accepted++;
-            try {
-                TransactionResponse response = outcome.future().get(TASK_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-                if (response != null && response.status() == TransactionStatus.SUCCESS) {
-                    results.add(BatchTransactionItemResult.success(response));
+            } else {
+                accepted++;
+                if (itemResult.status() == TransactionStatus.SUCCESS) {
                     successful++;
-                } else if (response != null) {
-                    // Business failure recorded by TransactionRecordingService
-                    results.add(BatchTransactionItemResult.failed(
-                            response.transactionId(),
-                            response.transactionType(),
-                            response.amount(),
-                            response.status(),
-                            response.failureReason()
-                    ));
-                    failed++;
                 } else {
-                    log.error("Batch {} — task {} returned null response", batchId, item.transactionId());
-                    results.add(BatchTransactionItemResult.failed(
-                            item.transactionId(),
-                            item.type(),
-                            item.amount(),
-                            TransactionStatus.FAILED,
-                            "Transaction returned null response"
-                    ));
                     failed++;
                 }
-            } catch (CancellationException ex) {
-                log.warn("Batch {} — task {} was cancelled", batchId, item.transactionId());
-                results.add(BatchTransactionItemResult.failed(
-                        item.transactionId(),
-                        item.type(),
-                        item.amount(),
-                        TransactionStatus.FAILED,
-                        "Task was cancelled"
-                ));
-                failed++;
-            } catch (ExecutionException ex) {
-                // Business exception thrown by TransactionService (e.g. InsufficientBalanceException)
-                // The failure record is already persisted by TransactionRecordingService.
-                String reason = ex.getCause() != null
-                        ? ex.getCause().getMessage()
-                        : ex.getMessage();
-                log.warn("Batch {} — task {} completed with business failure: {}",
-                        batchId, item.transactionId(), reason);
-                results.add(BatchTransactionItemResult.failed(
-                        item.transactionId(),
-                        item.type(),
-                        item.amount(),
-                        TransactionStatus.FAILED,
-                        reason
-                ));
-                failed++;
-            } catch (TimeoutException ex) {
-                log.error("Batch {} — task {} timed out after {}s",
-                        batchId, item.transactionId(), TASK_TIMEOUT_SECONDS);
-                outcome.future().cancel(true);
-                results.add(BatchTransactionItemResult.failed(
-                        item.transactionId(),
-                        item.type(),
-                        item.amount(),
-                        TransactionStatus.FAILED,
-                        "Task timed out after " + TASK_TIMEOUT_SECONDS + " seconds"
-                ));
-                failed++;
-            } catch (InterruptedException ex) {
-                Thread.currentThread().interrupt();
-                log.error("Batch {} — interrupted while collecting results", batchId);
-                results.add(BatchTransactionItemResult.failed(
-                        item.transactionId(),
-                        item.type(),
-                        item.amount(),
-                        TransactionStatus.FAILED,
-                        "Interrupted"
-                ));
-                failed++;
             }
         }
 
@@ -238,12 +190,89 @@ public class BatchTransactionService {
                 batchId, startedAt, completedAt, durationMs,
                 totalSubmitted, accepted, rejected, successful, failed,
                 executor.getCorePoolSize(), executor.getQueueCapacity(),
-                results);
+                resultList);
 
         log.info("Batch {} completed in {}ms — submitted={} accepted={} rejected={} successful={} failed={} TPS={}",
                 batchId, durationMs, totalSubmitted, accepted, rejected, successful, failed, summary.tps());
 
         return summary;
+    }
+
+    private void resolveAndStore(
+            int index,
+            BatchTransactionItem item,
+            Future<TransactionResponse> future,
+            BatchTransactionItemResult[] results,
+            String batchId) {
+        try {
+            TransactionResponse response = future.get(TASK_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            if (response != null && response.status() == TransactionStatus.SUCCESS) {
+                results[index] = BatchTransactionItemResult.success(response);
+            } else if (response != null) {
+                // Business failure recorded by TransactionRecordingService
+                results[index] = BatchTransactionItemResult.failed(
+                        response.transactionId(),
+                        response.transactionType(),
+                        response.amount(),
+                        response.status(),
+                        response.failureReason()
+                );
+            } else {
+                log.error("Batch {} — task {} returned null response", batchId, item.transactionId());
+                results[index] = BatchTransactionItemResult.failed(
+                        item.transactionId(),
+                        item.type(),
+                        item.amount(),
+                        TransactionStatus.FAILED,
+                        "Transaction returned null response"
+                );
+            }
+        } catch (CancellationException ex) {
+            log.warn("Batch {} — task {} was cancelled", batchId, item.transactionId());
+            results[index] = BatchTransactionItemResult.failed(
+                    item.transactionId(),
+                    item.type(),
+                    item.amount(),
+                    TransactionStatus.FAILED,
+                    "Task was cancelled"
+            );
+        } catch (ExecutionException ex) {
+            // Business exception thrown by TransactionService (e.g. InsufficientBalanceException)
+            // The failure record is already persisted by TransactionRecordingService.
+            String reason = ex.getCause() != null
+                    ? ex.getCause().getMessage()
+                    : ex.getMessage();
+            log.warn("Batch {} — task {} completed with business failure: {}",
+                    batchId, item.transactionId(), reason);
+            results[index] = BatchTransactionItemResult.failed(
+                    item.transactionId(),
+                    item.type(),
+                    item.amount(),
+                    TransactionStatus.FAILED,
+                    reason
+            );
+        } catch (TimeoutException ex) {
+            log.error("Batch {} — task {} timed out after {}s",
+                    batchId, item.transactionId(), TASK_TIMEOUT_SECONDS);
+            future.cancel(true);
+            results[index] = BatchTransactionItemResult.failed(
+                    item.transactionId(),
+                    item.type(),
+                    item.amount(),
+                    TransactionStatus.FAILED,
+                    "Task timed out after " + TASK_TIMEOUT_SECONDS + " seconds"
+            );
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            log.error("Batch {} — interrupted while collecting results", batchId);
+            results[index] = BatchTransactionItemResult.failed(
+                    item.transactionId(),
+                    item.type(),
+                    item.amount(),
+                    TransactionStatus.FAILED,
+                    "Interrupted"
+            );
+        }
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────

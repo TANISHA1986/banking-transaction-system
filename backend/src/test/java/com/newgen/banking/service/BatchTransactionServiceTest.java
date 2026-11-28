@@ -255,4 +255,60 @@ class BatchTransactionServiceTest {
         assertEquals(TransactionStatus.FAILED, result.results().get(0).status());
         assertEquals("Task was cancelled", result.results().get(0).failureReason());
     }
+
+    @Test
+    @DisplayName("Batch larger than queue capacity: sliding window backpressure allows all items to complete")
+    void processBatch_BatchLargerThanQueueCapacity_AllCompleteSuccessfully() {
+        int count = 25;
+        List<BatchTransactionItem> items = new java.util.ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            items.add(new BatchTransactionItem("TXN-LARGE-" + i, TransactionType.DEPOSIT, null, 1L, new BigDecimal("10.00"), null));
+        }
+        BatchTransactionRequest request = new BatchTransactionRequest("BATCH-LARGE-QUEUE", items);
+
+        // Queue capacity is 10, meaning maxInFlight = 5 (much smaller than batch size 25)
+        when(executor.getCorePoolSize()).thenReturn(4);
+        when(executor.getQueueCapacity()).thenReturn(10);
+        when(executor.submit(any())).thenAnswer(invocation ->
+                completedFuture(successResponse("TXN-LARGE", TransactionType.DEPOSIT, new BigDecimal("10.00"))));
+
+        BatchTransactionResult result = batchService.processBatch(request);
+
+        assertEquals(25, result.totalSubmitted());
+        assertEquals(25, result.accepted(), "All 25 items should be accepted via sliding window");
+        assertEquals(0, result.rejected(), "No items should be rejected by self-saturation");
+        assertEquals(25, result.successful(), "All 25 items should succeed");
+        assertEquals(0, result.failed());
+        assertEquals(25, result.results().size());
+    }
+
+    @Test
+    @DisplayName("Genuine queue saturation from concurrent load: rejections recorded gracefully while accepted tasks complete")
+    void processBatch_GenuineQueueSaturation_RejectionsHandledCorrectly() {
+        List<BatchTransactionItem> items = List.of(
+                new BatchTransactionItem("TXN-SAT-1", TransactionType.DEPOSIT, null, 1L, new BigDecimal("10.00"), null),
+                new BatchTransactionItem("TXN-SAT-2", TransactionType.DEPOSIT, null, 1L, new BigDecimal("10.00"), null),
+                new BatchTransactionItem("TXN-SAT-3", TransactionType.DEPOSIT, null, 1L, new BigDecimal("10.00"), null),
+                new BatchTransactionItem("TXN-SAT-4", TransactionType.DEPOSIT, null, 1L, new BigDecimal("10.00"), null)
+        );
+        BatchTransactionRequest request = new BatchTransactionRequest("BATCH-SATURATION", items);
+
+        when(executor.getCorePoolSize()).thenReturn(2);
+        when(executor.getQueueCapacity()).thenReturn(10);
+        when(executor.submit(any()))
+                .thenReturn(completedFuture(successResponse("TXN-SAT-1", TransactionType.DEPOSIT, new BigDecimal("10.00"))))
+                .thenReturn(completedFuture(successResponse("TXN-SAT-2", TransactionType.DEPOSIT, new BigDecimal("10.00"))))
+                .thenThrow(new TaskRejectedException("External saturation: pool and queue full"))
+                .thenReturn(completedFuture(successResponse("TXN-SAT-4", TransactionType.DEPOSIT, new BigDecimal("10.00"))));
+
+        BatchTransactionResult result = batchService.processBatch(request);
+
+        assertEquals(4, result.totalSubmitted());
+        assertEquals(3, result.accepted());
+        assertEquals(1, result.rejected());
+        assertEquals(3, result.successful());
+        assertEquals(0, result.failed());
+        assertEquals(TransactionStatus.REJECTED, result.results().get(2).status());
+        assertTrue(result.results().get(2).failureReason().contains("pool saturated"));
+    }
 }

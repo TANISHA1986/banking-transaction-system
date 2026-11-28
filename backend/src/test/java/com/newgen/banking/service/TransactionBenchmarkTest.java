@@ -160,11 +160,68 @@ class TransactionBenchmarkTest {
         printReport("Stress — 1000 deposits (max batch size)", result);
         assertCorrectness(result, 1000);
 
+        assertEquals(1000, result.totalSubmitted(), "Total submitted must be 1000");
+        assertEquals(1000, result.accepted(), "All 1000 transactions must be accepted via bounded backpressure");
+        assertEquals(0, result.rejected(), "0 transactions should be rejected in a valid 1000 batch");
+        assertEquals(1000, result.successful(), "All 1000 deposits must succeed");
+        assertEquals(0, result.failed(), "0 deposits should fail");
+
         // 1000 × 1.00 = 1000.00 added
         BigDecimal balance = accountRepository.findById(account.getId()).orElseThrow().getBalance();
         // All 1000 must succeed because deposits never fail on balance
         assertBigDecimalEquals(new BigDecimal("1000.00"), balance,
                 "All 1000 deposits must have been applied, balance should be 1000.00");
+    }
+
+    // ── Scenario 5 — Genuine Queue Saturation Test ───────────────────────────
+
+    @Test
+    void benchmark_GenuineQueueSaturation_WhenExternalLoadExhaustsQueue() {
+        TransactionExecutorProperties tinyProps = new TransactionExecutorProperties();
+        tinyProps.setCorePoolSize(1);
+        tinyProps.setMaxPoolSize(1);
+        tinyProps.setQueueCapacity(2);
+        tinyProps.setThreadNamePrefix("sat-test-");
+        TransactionThreadPoolExecutor tinyPool = new TransactionThreadPoolExecutor(tinyProps);
+        tinyPool.start();
+
+        try {
+            Customer c = saveCustomer("Bench Saturation");
+            Account account = saveAccount(c, new BigDecimal("0.00"), AccountStatus.ACTIVE);
+
+            // Submit 3 blocking background tasks directly to tinyPool to completely fill 1 worker + 2 queue slots
+            java.util.concurrent.CountDownLatch blockerLatch = new java.util.concurrent.CountDownLatch(1);
+            for (int i = 0; i < 3; i++) {
+                tinyPool.submit(() -> {
+                    blockerLatch.await(5, java.util.concurrent.TimeUnit.SECONDS);
+                    return null;
+                });
+            }
+
+            // Pool now has 1 active thread + 2 queued tasks = 3 (100% full).
+            // Initial submissions to tinyPool will throw TaskRejectedException.
+            BatchTransactionService saturatedBatchService = new BatchTransactionService(transactionService, tinyPool);
+            List<BatchTransactionItem> items = buildDeposits(account.getId(), 5);
+            BatchTransactionResult result = saturatedBatchService.processBatch(
+                    new BatchTransactionRequest("BENCH-SATURATION", items)
+            );
+
+            blockerLatch.countDown();
+
+            printReport("Genuine Saturation — External load filling pool", result);
+
+            // Verify that genuine external saturation produces rejections gracefully
+            assertTrue(result.rejected() > 0, "External queue saturation must result in task rejections");
+            assertEquals(5, result.totalSubmitted());
+            assertEquals(result.accepted() + result.rejected(), result.totalSubmitted());
+
+            // Balance must match only the successful deposits, zero lost transactions or double counts
+            BigDecimal expectedBalance = new BigDecimal("1.00").multiply(BigDecimal.valueOf(result.successful()));
+            BigDecimal actualBalance = accountRepository.findById(account.getId()).orElseThrow().getBalance();
+            assertBigDecimalEquals(expectedBalance, actualBalance, "Balance must strictly match successful count");
+        } finally {
+            tinyPool.stop();
+        }
     }
 
     // ── Progressive Worker Benchmarks ────────────────────────────────────────

@@ -1,227 +1,131 @@
-# Thread Pool Design — Day 5
+# Thread Pool & Concurrent Batch Processing Design
 
-## Overview
+## 1. Overview
 
-Day 5 adds a **bounded thread pool executor** and a **batch transaction endpoint** so that multiple banking transactions can be processed concurrently instead of one at a time.
+The **Multi-Threaded Banking Transaction Processing System** features a custom bounded thread pool executor ([TransactionThreadPoolExecutor.java](file:///c:/Users/XPS/Documents/Newgen-Project/banking-transaction-system/backend/src/main/java/com/newgen/banking/executor/TransactionThreadPoolExecutor.java)) and a batch transaction processing service ([BatchTransactionService.java](file:///c:/Users/XPS/Documents/Newgen-Project/banking-transaction-system/backend/src/main/java/com/newgen/banking/service/BatchTransactionService.java)). This allows clients to submit batches of up to 1,000 transactions concurrently, achieving high throughput while enforcing back-pressure and protecting JVM memory and database connection limits.
+
+---
+
+## 2. Bounded Queue Architecture & Back-Pressure
 
 ```mermaid
-flowchart TD
-    Client["HTTP Client"]
-    Controller["TransactionController\nPOST /api/transactions/batch"]
-    Batch["BatchTransactionService\n processBatch()"]
-    Pool["TransactionThreadPoolExecutor\nLinkedBlockingQueue (bounded)"]
-    W1["txn-worker-1"]
-    W2["txn-worker-2"]
-    W3["txn-worker-N"]
-    TxnSvc["TransactionService\ndeposit / withdraw / transfer"]
-    DB["PostgreSQL\n(pessimistic locks – Day 4)"]
-    Rec["TransactionRecordingService\nPropagation.REQUIRES_NEW"]
-    Result["BatchTransactionResult\n(counts + per-item results)"]
+flowchart LR
+    subgraph Client ["Client Layer"]
+        POST["POST /api/transactions/batch"]
+    end
 
-    Client --> Controller --> Batch
-    Batch -->|submit Callable| Pool
-    Pool --> W1 & W2 & W3
-    W1 & W2 & W3 -->|call| TxnSvc --> DB
-    TxnSvc --> Rec --> DB
-    Batch -->|collect Future results| Result --> Controller --> Client
+    subgraph Service ["BatchTransactionService"]
+        LOOP["Submission Loop"]
+        RESULT["Aggregated BatchTransactionResult"]
+    end
+
+    subgraph Executor ["TransactionThreadPoolExecutor"]
+        CORE["Core Workers (5)"]
+        QUEUE["LinkedBlockingQueue (Capacity: 500)"]
+        MAX["Max Workers (20)"]
+        REJECT["TaskRejectedException (Back-Pressure)"]
+    end
+
+    POST --> LOOP
+    LOOP -->|1. Submit Task| CORE
+    CORE -->|Core Busy| QUEUE
+    QUEUE -->|Queue Full| MAX
+    MAX -->|Pool & Queue Saturated| REJECT
+    REJECT -.->|Record as REJECTED| RESULT
+    CORE --> RESULT
+    MAX --> RESULT
 ```
 
----
+### 2.1 Why Bounded Queues (Capacity = 500)?
+An unbounded queue (`new LinkedBlockingQueue<>()`) grows without limit when incoming request rates exceed database processing speeds. This leads to:
+1. **Memory Exhaustion (OOM):** Heap overflows from accumulating millions of queued tasks.
+2. **Latency Inflation:** Requests sit in memory for minutes; by the time they run, the client has timed out.
+3. **No Back-Pressure:** The producer receives no signal to throttle.
 
-## Why a Bounded Queue (not unbounded)?
+With a bounded capacity of 500:
+- When workers and queue are full, `RejectedExecutionHandler` throws `TaskRejectedException`.
+- The batch service catches this and marks the item status as `REJECTED`, returning immediately to the client with clear saturation indicators.
 
-An unbounded queue (`new LinkedBlockingQueue<>()` with no capacity limit) can grow without limit when producers add work faster than workers consume it. In a banking system this means:
+### 2.2 Controlled In-Flight Sliding Window (Bounded Backpressure)
+When a valid batch contains up to 1,000 transactions, submitting all 1,000 tasks in a tight unpaced loop would immediately saturate a bounded queue (e.g., test capacity of 100 or production capacity of 500), causing self-rejection of valid tasks.
 
-- **Memory exhaustion** — the JVM runs out of heap and crashes under a sudden load spike.
-- **Latency time-bomb** — requests pile up silently; by the time a task finally runs, the client has long since timed out and the result is useless.
-- **No back-pressure** — the caller (HTTP client, another service) is never told that the system is overloaded; it keeps sending.
-
-A bounded `LinkedBlockingQueue(capacity)` provides **back-pressure**: once both the pool threads and the queue are full, the custom `RejectedExecutionHandler` throws `TaskRejectedException`, which `BatchTransactionService` catches and records as a `REJECTED` result — the client is informed immediately that the system is busy.
-
----
-
-## Why `ThreadPoolExecutor` (not `Executors.newFixedThreadPool()`)?
-
-`Executors.newFixedThreadPool(n)` is a convenience wrapper that creates a `ThreadPoolExecutor` with an **unbounded** queue — the exact problem we just described. Using `ThreadPoolExecutor` directly lets us control every parameter:
-
-| Parameter | Value (default) | Why |
-|---|---|---|
-| `corePoolSize` | 5 | Threads kept alive even when idle |
-| `maxPoolSize` | 20 | Maximum concurrent workers |
-| `queueCapacity` | 500 | Bounded buffer; enables back-pressure |
-| `keepAliveSeconds` | 60 | Idle threads above core are released |
-| `threadNamePrefix` | `txn-worker-` | Named threads → readable stack traces |
-| `shutdownTimeoutSeconds` | 30 | Graceful drain before forced shutdown |
-
-All values are **externally configurable** via `application.properties` — no recompile needed to tune for production vs. test.
+To prevent self-saturation while strictly preserving bounded queues:
+- `BatchTransactionService` implements a **controlled sliding window** where in-flight tasks submitted to the executor are capped at:
+  $$\text{maxInFlight} = \min\left(\max\left(1, \frac{\text{queueCapacity}}{2}\right), 100\right)$$
+- As tasks complete, completed futures are eagerly reaped via `.isDone()`.
+- If the active in-flight count reaches `maxInFlight`, the producer waits on the oldest in-flight task before offering more work to the executor.
+- This guarantees:
+  1. Valid 1,000-transaction batches process continuously without self-induced queue overflow.
+  2. The queue always maintains at least 50% headroom for external requests.
+  3. If external load genuinely exhausts the queue, `TaskRejectedException` is cleanly captured as `TransactionStatus.REJECTED`.
+  4. Every accepted task is guaranteed to complete before `processBatch` returns.
 
 ---
 
-## Why `SmartLifecycle` (not `@Bean` with `@PreDestroy`)?
+## 3. Configuration & Tuning Parameters
 
-`SmartLifecycle` integrates the executor with Spring's context lifecycle:
+All thread pool settings are externalized in `application.properties`:
 
-- **`start()`** — called automatically when the application context starts; creates the `ThreadPoolExecutor`.
-- **`stop()`** — called when the context is closing (SIGTERM, `ContextClosedEvent`); calls `executor.shutdown()` and waits up to `shutdownTimeoutSeconds` for in-flight tasks to finish before forcing shutdown.
-- This guarantees that **no transaction is silently abandoned** during a graceful restart or deployment.
-
----
-
-## Why `Propagation.REQUIRES_NEW` in `TransactionRecordingService`?
-
-Each deposit / withdrawal / transfer:
-1. Opens **outer transaction** (via `@Transactional` in `TransactionService`).
-2. Calls `TransactionRecordingService.recordSuccess/recordFailure`, which opens a **brand-new inner transaction** (`REQUIRES_NEW`).
-
-The inner transaction commits independently. If the outer transaction rolls back (e.g. a runtime exception after the balance update), the audit and failure records **still survive** in the database — this is essential for auditability.
-
-**Integration test implication:** If a test class is `@Transactional`, Spring wraps each test in an uncommitted transaction. `REQUIRES_NEW` opens a new DB connection which cannot see that uncommitted data (PostgreSQL READ COMMITTED isolation), causing FK violations. Solution: **no `@Transactional` on integration test classes** that call `REQUIRES_NEW` production code — use `@AfterEach` cleanup instead.
+| Property | Default | Test Profile | Purpose |
+|---|:---:|:---:|---|
+| `banking.executor.core-pool-size` | `5` | `4` | Worker threads kept alive permanently. |
+| `banking.executor.max-pool-size` | `20` | `8` | Maximum burst worker threads spun up when queue is full. |
+| `banking.executor.queue-capacity` | `500` | `100` | Bounded capacity before tasks trigger back-pressure. |
+| `banking.executor.keep-alive-seconds` | `60` | `10` | Expiry time for idle non-core worker threads. |
+| `banking.executor.shutdown-timeout-seconds` | `30` | `10` | Graceful drain timeout during application shutdown. |
+| `banking.executor.thread-name-prefix` | `txn-worker-` | `test-txn-worker-` | Prefix for thread inspection in logs and thread dumps. |
 
 ---
 
-## Configurable Properties
+## 4. Lifecycle Management (`SmartLifecycle`)
 
-Add or override in `application.properties` (main) or `application-test.properties` (tests):
-
-```properties
-# banking-transaction-system/backend/src/main/resources/application.properties
-
-banking.executor.core-pool-size=5
-banking.executor.max-pool-size=20
-banking.executor.queue-capacity=500
-banking.executor.keep-alive-seconds=60
-banking.executor.thread-name-prefix=txn-worker-
-banking.executor.shutdown-timeout-seconds=30
-```
+Instead of standard `@PreDestroy`, `TransactionThreadPoolExecutor` implements Spring's `SmartLifecycle`:
+- **`start()`:** Initializes the `ThreadPoolExecutor`, custom `ThreadFactory`, and `LinkedBlockingQueue` when the Spring Application Context finishes starting.
+- **`stop()`:** Invoked on SIGTERM or context closure. Initiates `executor.shutdown()` and blocks up to `shutdownTimeoutSeconds` (30s) allowing in-flight banking transactions to complete and commit before forcing `executor.shutdownNow()`.
+- **Guarantee:** No in-flight banking transaction is killed mid-mutation during application restarts.
 
 ---
 
-## Batch Endpoint
+## 5. Dual Propagation in Transaction Recording
 
-### Request
+During Day 5/6 benchmarking, we optimized the database transaction scope:
+- **`recordSuccess()` (`Propagation.REQUIRED`):** Commits the balance update, `bank_transactions` record, and `transaction_audits` entry on the **same database connection**. This eliminated connection pool deadlocks by dropping connection requirements to 1 per worker thread.
+- **`recordFailure()` (`Propagation.REQUIRES_NEW`):** Borrows an independent connection so that failure reasons (`INSUFFICIENT_BALANCE`, `INACTIVE_ACCOUNT`) persist permanently even when the outer transaction rolls back.
 
-```
-POST /api/transactions/batch
-Content-Type: application/json
-```
+---
+
+## 6. Batch Endpoint Usage & Performance Verification
+
+Clients submit up to 1,000 transactions to `POST /api/transactions/batch`:
 
 ```json
 {
-  "batchId": "BATCH-2026-001",
+  "batchId": "BATCH-20261128-01",
   "transactions": [
     {
-      "transactionId": "TXN-DEP-001",
+      "transactionId": "TXN-B01-001",
       "type": "DEPOSIT",
       "destinationAccountId": 1,
-      "amount": 500.00,
+      "amount": 100.00,
       "description": "Salary deposit"
     },
     {
-      "transactionId": "TXN-WDR-001",
-      "type": "WITHDRAWAL",
-      "sourceAccountId": 2,
-      "amount": 200.00,
-      "description": "ATM withdrawal"
-    },
-    {
-      "transactionId": "TXN-TRF-001",
+      "transactionId": "TXN-B01-002",
       "type": "TRANSFER",
       "sourceAccountId": 1,
       "destinationAccountId": 2,
-      "amount": 100.00,
-      "description": "Rent transfer"
+      "amount": 50.00,
+      "description": "Savings transfer"
     }
   ]
 }
 ```
 
-**Validation rules:**
-- `transactions` must not be empty and must not exceed 1,000 items.
-- Each item must have `type` and `amount` (> 0, ≤ 2 decimal places).
-- `batchId` and `transactionId` are optional; the server generates them if omitted.
-- `DEPOSIT` requires `destinationAccountId`; `WITHDRAWAL` requires `sourceAccountId`; `TRANSFER` requires both.
-
-### Response (`200 OK`)
-
-The endpoint always returns `200 OK` with a full summary — individual transaction failures are reflected in the per-item `results` array, **not** as HTTP 4xx/5xx errors.
-
-```json
-{
-  "batchId": "BATCH-2026-001",
-  "startedAt": "2026-11-27T10:00:00",
-  "completedAt": "2026-11-27T10:00:00.142",
-  "durationMs": 142,
-  "totalSubmitted": 3,
-  "accepted": 3,
-  "rejected": 0,
-  "successful": 3,
-  "failed": 0,
-  "tps": 21.13,
-  "workerCount": 5,
-  "queueCapacity": 500,
-  "results": [
-    {
-      "transactionId": "TXN-DEP-001",
-      "type": "DEPOSIT",
-      "amount": 500.00,
-      "status": "SUCCESS",
-      "failureReason": null
-    },
-    {
-      "transactionId": "TXN-WDR-001",
-      "type": "WITHDRAWAL",
-      "amount": 200.00,
-      "status": "SUCCESS",
-      "failureReason": null
-    },
-    {
-      "transactionId": "TXN-TRF-001",
-      "type": "TRANSFER",
-      "amount": 100.00,
-      "status": "SUCCESS",
-      "failureReason": null
-    }
-  ]
-}
-```
-
-**Status values in `results[].status`:**
-
-| Status | Meaning |
-|---|---|
-| `SUCCESS` | Transaction processed; balance(s) updated |
-| `FAILED` | Business rule rejected it (e.g. insufficient balance) — balance unchanged |
-| `REJECTED` | Thread pool saturated; task was never queued — balance unchanged |
-
----
-
-## Benchmark Results
-
-> [!NOTE]
-> Benchmarks are run via `TransactionBenchmarkTest` (`@Tag("benchmark")`) against `banking_test_db`.
-> Results depend on hardware and PostgreSQL configuration; the values below are representative.
-
-| Scenario | Transactions | Type | Duration (ms) | TPS |
-|---|---|---|---|---|
-| Small | 50 | DEPOSIT | ~200 | ~250 |
-| Medium | 200 | Mixed | ~400 | ~500 |
-| Large | 500 | TRANSFER | ~900 | ~555 |
-| Stress | 1,000 | DEPOSIT | ~1,800 | ~555 |
-
-> [!TIP]
-> Run benchmarks yourself: `.\mvnw.cmd test -Dgroups=benchmark`
-> Actual TPS scales with `maxPoolSize`, queue capacity, and DB hardware.
-
----
-
-## Financial Correctness Guarantees
-
-The thread pool is an execution layer **on top of** the Day 4 pessimistic locking:
-
-1. **Multiple workers** can call `TransactionService.deposit/withdraw/transfer` simultaneously.
-2. Each call acquires a `SELECT … FOR UPDATE` lock on the account row(s).
-3. PostgreSQL serialises concurrent updates to the same account — balance can never go negative.
-4. Worker threads hold **only DTO values** (immutable records) — no shared `EntityManager` or JPA proxy across threads.
-
-> [!IMPORTANT]
-> Financial correctness is **enforced by the database**, not by thread coordination. The thread pool's only job is concurrent submission — correctness under concurrency was proven in Day 4.
+The service processes tasks concurrently across worker threads and returns full execution metrics:
+- `totalSubmitted`: Total tasks in request
+- `accepted`: Tasks accepted into queue
+- `rejected`: Tasks rejected due to queue saturation
+- `successful`: Transactions committed with `SUCCESS`
+- `failed`: Transactions completed with business `FAILED` status
+- `durationMs`: Wall-clock processing time
+- `tps`: Throughput in Transactions Per Second
