@@ -14,6 +14,8 @@ import com.newgen.banking.repository.BankTransactionRepository;
 import com.newgen.banking.repository.CustomerRepository;
 import com.newgen.banking.repository.FailedTransactionRepository;
 import com.newgen.banking.repository.TransactionAuditRepository;
+import com.zaxxer.hikari.HikariDataSource;
+import com.zaxxer.hikari.HikariPoolMXBean;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
@@ -23,6 +25,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.ActiveProfiles;
+
+import javax.sql.DataSource;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
@@ -72,6 +76,7 @@ class TransactionBenchmarkTest {
     @Autowired private BankTransactionRepository bankTransactionRepository;
     @Autowired private TransactionAuditRepository transactionAuditRepository;
     @Autowired private FailedTransactionRepository failedTransactionRepository;
+    @Autowired private DataSource dataSource;
 
     @BeforeEach
     @AfterEach
@@ -304,6 +309,7 @@ class TransactionBenchmarkTest {
 
     private void printReport(String scenarioName, BatchTransactionResult r) {
         double tpsDouble = r.tps() != null ? r.tps().doubleValue() : 0.0;
+        String poolInfo = getHikariPoolSummary();
         log.info("""
                 
                 ╔══════════════════════════════════════════════════════════════╗
@@ -318,13 +324,15 @@ class TransactionBenchmarkTest {
                   TPS             : {}
                   Worker count    : {}
                   Queue capacity  : {}
+                  HikariCP Pool   : {}
                 ╚══════════════════════════════════════════════════════════════╝
                 """,
                 scenarioName,
                 r.totalSubmitted(), r.accepted(), r.rejected(),
                 r.successful(), r.failed(),
                 r.durationMs(), String.format("%.2f", tpsDouble),
-                r.workerCount(), r.queueCapacity()
+                r.workerCount(), r.queueCapacity(),
+                poolInfo
         );
         if (r.failed() > 0 && r.results() != null) {
             r.results().stream()
@@ -332,6 +340,21 @@ class TransactionBenchmarkTest {
                     .limit(5)
                     .forEach(item -> log.warn("Sample failure [{}]: {}", item.transactionId(), item.failureReason()));
         }
+    }
+
+    private String getHikariPoolSummary() {
+        if (dataSource instanceof HikariDataSource hikari) {
+            HikariPoolMXBean mxBean = hikari.getHikariPoolMXBean();
+            if (mxBean != null) {
+                return String.format("total=%d active=%d idle=%d awaiting=%d (max=%d)",
+                        mxBean.getTotalConnections(),
+                        mxBean.getActiveConnections(),
+                        mxBean.getIdleConnections(),
+                        mxBean.getThreadsAwaitingConnection(),
+                        hikari.getMaximumPoolSize());
+            }
+        }
+        return "N/A";
     }
 
     // ── Fixture helpers ───────────────────────────────────────────────────────

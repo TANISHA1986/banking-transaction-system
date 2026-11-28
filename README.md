@@ -4,11 +4,12 @@
 
 This project is a Java, Spring Boot, and PostgreSQL banking transaction processing system designed to support customer and account management, deposits, withdrawals, fund transfers, concurrent transaction processing, and audit/failure tracking.
 
-## Current Implementation Status (Day 5 — Bounded Thread Pool & Batch Processing)
+## Current Implementation Status (Day 6 — Benchmarking, SQL Reports & Optimization)
 
 Currently implemented:
 - Spring Boot Maven backend skeleton (`banking-system`)
 - PostgreSQL DDL for `customers` (`001_create_customers.sql`), `accounts` + `account_number_seq` (`002_create_accounts.sql`), and `bank_transactions`, `transaction_audits`, `failed_transactions` (`003_create_transactions.sql`)
+- Justified performance index script (`004_performance_indexes.sql`)
 - Health check endpoint (`GET /api/v1/health`)
 - Customer registration and retrieval APIs (`/api/customers`)
 - Account management APIs (`/api/accounts`)
@@ -19,11 +20,16 @@ Currently implemented:
 - Unit, WebMVC slice, and PostgreSQL integration tests for Customer, Account, and Transaction modules
 - **Pessimistic write locking (`SELECT … FOR UPDATE`)** on all balance-mutating operations — prevents lost updates and negative balances under concurrent load
 - **Ordered lock acquisition for transfers** — both accounts always locked in ascending ID order, eliminating deadlocks
-- **`TransactionRecordingService` with `Propagation.REQUIRES_NEW`** — failure and audit records commit independently, surviving outer transaction rollback
+- **`TransactionRecordingService` with `Propagation.REQUIRED` for success** — atomic commit of balance updates, transaction records, and audit entries on 1 connection
+- **`TransactionRecordingService` with `Propagation.REQUIRES_NEW` for failure** — failure and audit records commit independently, surviving outer transaction rollback
 - **`TransactionConcurrencyTest`** — PostgreSQL integration tests proving correct behaviour under simultaneous requests (concurrent deposits, withdrawals, duplicate IDs, opposite-direction transfers)
 - **`TransactionThreadPoolExecutor`** — bounded `LinkedBlockingQueue`, named worker threads (`txn-worker-N`), `SmartLifecycle` for graceful shutdown, `TaskRejectedException` for back-pressure
 - **`BatchTransactionService`** — submits DEPOSIT / WITHDRAWAL / TRANSFER items as `Callable`s to the pool; collects `Future` results; aggregates success / failed / rejected counts
-- **`TransactionBenchmarkTest`** (`@Tag("benchmark")`) — 4 scenarios (50 / 200 / 500 / 1,000 transactions) with real DB; prints TPS report to stdout
+- **`TransactionBenchmarkTest`** (`@Tag("benchmark")`) — progressive benchmarks (1, 5, 10, 20 workers with 200 transfers) + mixed scenarios (50 / 200 / 500 / 1,000 transactions)
+- **`StressBenchmark50kTest`** (`@Tag("benchmark-50k")`) — repeatable 50,000-transaction stress benchmark in chunked batches of 500 with 10 active + frozen accounts, measuring throughput and verifying balance conservation
+- **Comprehensive SQL Reports (`database/reports/`)** — 5 required reports (Top 10 accounts by volume, failed transactions by reason, daily transaction amount by type, accounts with > N transactions, customer transaction history)
+- **Query Performance Analysis (`docs/sql-performance-analysis.md`)** — structural index analysis, before/after execution plans, and justified indexes
+- **Sample Seed Data Script (`database/seed/seed_data.sql`)** — repeatable seed data for demo and report verification
 
 ## Concurrency Design
 
@@ -240,6 +246,70 @@ cd backend
 .\mvnw.cmd test "-Dtest=TransactionServiceTest,TransactionControllerTest"
 ```
 
+## Running Benchmarks (Local PostgreSQL)
+
+Ensure PostgreSQL is running and set your local test database password in PowerShell:
+```powershell
+$env:TEST_DB_PASSWORD="your_postgres_password"
+cd backend
+```
+
+### 1. Progressive Benchmarks (200 transfers per worker tier)
+```powershell
+# 1 Worker
+.\mvnw.cmd test "-Dtest=TransactionBenchmarkTest#benchmark_1Worker_200Transfers"
+
+# 5 Workers
+.\mvnw.cmd test "-Dtest=TransactionBenchmarkTest#benchmark_5Workers_200Transfers"
+
+# 10 Workers
+.\mvnw.cmd test "-Dtest=TransactionBenchmarkTest#benchmark_10Workers_200Transfers"
+
+# 20 Workers
+.\mvnw.cmd test "-Dtest=TransactionBenchmarkTest#benchmark_20Workers_200Transfers"
+```
+
+### 2. 50,000+ Transaction Stress Benchmark
+Submits 50,000 mixed transactions (deposits, withdrawals, transfers, and business failures) in controlled chunks of 500 across 10 active accounts:
+```powershell
+# Run with 10 workers (recommended default)
+.\mvnw.cmd test "-Dtest=StressBenchmark50kTest#benchmark50k_10Workers"
+
+# Run with 1, 5, or 20 workers
+.\mvnw.cmd test "-Dtest=StressBenchmark50kTest#benchmark50k_1Worker"
+.\mvnw.cmd test "-Dtest=StressBenchmark50kTest#benchmark50k_5Workers"
+.\mvnw.cmd test "-Dtest=StressBenchmark50kTest#benchmark50k_20Workers"
+```
+
+## SQL Reports (`database/reports/`)
+
+Run against PostgreSQL (`banking_test_db` or `banking_db`):
+```powershell
+$env:PGPASSWORD="your_postgres_password"
+
+# 1. Top 10 accounts by volume
+psql -U postgres -d banking_test_db -f database/reports/01_top_10_accounts_by_volume.sql
+
+# 2. Failed transactions grouped by reason
+psql -U postgres -d banking_test_db -f database/reports/02_failed_transactions_by_reason.sql
+
+# 3. Daily transaction amount by type
+psql -U postgres -d banking_test_db -f database/reports/03_daily_transaction_amount_by_type.sql
+
+# 4. Accounts with more than N transactions
+psql -U postgres -d banking_test_db -v min_tx_count=10 -f database/reports/04_accounts_with_more_than_n_transactions.sql
+
+# 5. Customer transaction history
+psql -U postgres -d banking_test_db -v customer_id=1 -f database/reports/05_customer_transaction_history.sql
+```
+
+## Performance & Gap Analysis Documentation
+
+- [docs/sql-performance-analysis.md](docs/sql-performance-analysis.md) — Query execution plan analysis and index justifications
+- [docs/assignment-completion-checklist.md](docs/assignment-completion-checklist.md) — Assignment requirement gap analysis and evidence matrix
+- [docs/concurrency-design.md](docs/concurrency-design.md) — Pessimistic locking and deadlock prevention architecture
+- [docs/thread-pool-design.md](docs/thread-pool-design.md) — Bounded executor and batch processing design
+
 ## Project Structure
 
-See [docs/project-structure.md](docs/project-structure.md) for the current repository layout.
+See [docs/project-structure.md](docs/project-structure.md) for the complete repository layout.
